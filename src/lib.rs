@@ -105,6 +105,13 @@ impl Stream {
         }
     }
 
+    fn could_read(&self) -> bool {
+        match &self.state {
+            StreamState::Normal { buf, .. } | StreamState::Draining { buf } => !buf.is_empty(),
+            StreamState::AwaitingConfirmation | StreamState::Done => false,
+        }
+    }
+
     fn write_interest(&self) -> bool {
         match &self.state {
             StreamState::Normal { buf, .. } | StreamState::Draining { buf } => !buf.is_empty(),
@@ -142,26 +149,22 @@ impl Stream {
         }
     }
 
-    fn become_truncating_close(&mut self) {
+    fn become_at_least_truncating_close(&mut self) {
         debug!("become-truncating-close");
         self.state = match self.state {
-            StreamState::Normal { .. } | StreamState::Draining { .. } => {
-                StreamState::AwaitingConfirmation
-            }
-            StreamState::AwaitingConfirmation | StreamState::Done => panic!("invalid state"),
+            StreamState::Normal { .. }
+            | StreamState::Draining { .. }
+            | StreamState::AwaitingConfirmation => StreamState::AwaitingConfirmation,
+            StreamState::Done => StreamState::Done,
         };
     }
 
-    fn become_draining_close(&mut self) {
+    fn become_at_least_draining_close(&mut self) {
         debug!("become-draining-close");
-        let borrow_checker_avoid = StreamState::AwaitingConfirmation;
-        let mut temp_state = mem::replace(&mut self.state, borrow_checker_avoid);
-        self.state = match temp_state {
+        replace_with::replace_with_or_abort(&mut self.state, |state| match state {
             StreamState::Normal { buf, .. } => StreamState::Draining { buf },
-            StreamState::Draining { .. }
-            | StreamState::AwaitingConfirmation
-            | StreamState::Done => panic!("invalid state"),
-        };
+            other => other,
+        })
     }
 
     fn totes_done(&mut self) {
@@ -212,7 +215,7 @@ impl<'n> Io<'n> {
         self.as_conn()
             .read_buffer
             .buf()
-            .expect("TODO: read buffer closed")
+            .expect("TODO: buf: read buffer closed")
     }
 
     pub fn consume(&mut self, len: usize) {
@@ -220,7 +223,7 @@ impl<'n> Io<'n> {
             self.as_conn_mut()
                 .read_buffer
                 .buf_mut()
-                .expect("TODO: read buffer closed")
+                .expect("TODO: consume: read buffer closed")
                 .drain(..len),
         )
     }
@@ -235,8 +238,8 @@ impl<'n> Io<'n> {
 
     pub fn close(&mut self) -> () {
         let conn = self.as_conn_mut();
-        conn.read_buffer.become_truncating_close();
-        conn.write_buffer.become_draining_close();
+        conn.read_buffer.become_at_least_truncating_close();
+        conn.write_buffer.become_at_least_draining_close();
     }
 }
 
@@ -360,9 +363,6 @@ impl Net {
 
             info!("{} woke", ev.token().0);
 
-            // TODO: outrageous duplication
-            let mut woke = Vec::new();
-
             match us.mode {
                 OwnedMode::Server(ref server) => {
                     let (sock, addr) = match block_to_none(server.inner.accept())? {
@@ -370,7 +370,7 @@ impl Net {
                         None => continue,
                     };
                     let new = self.bump_token();
-                    woke.push(Event::NewConnection(new));
+                    self.events.push_back(Event::NewConnection(new));
                     self.poll
                         .register(&sock, new, Ready::readable(), PollOpt::edge())?;
                     self.tokens.insert(
@@ -385,27 +385,39 @@ impl Net {
                         },
                     );
                 }
-                OwnedMode::Conn(ref mut conn) => shunt_io(&mut woke, conn, ev.token()),
+                OwnedMode::Conn(ref mut conn) => shunt_io(conn, ev.token()),
             }
-
-            self.events.extend(woke);
         }
+
+        self.generate_events();
 
         Ok(())
     }
+
+    fn generate_events(&mut self) {
+        for (token, us) in &self.tokens {
+            match &us.mode {
+                OwnedMode::Server(_) => (),
+                OwnedMode::Conn(conn) => {
+                    if conn.read_buffer.could_read() {
+                        self.events.push_back(Event::Data(*token));
+                    }
+                }
+            }
+        }
+    }
 }
 
-fn shunt_io(woke: &mut Vec<Event>, conn: &mut Conn, token: Token) {
-    while conn.read_buffer.do_read() && do_a_read(woke, conn, token) {}
-    while conn.write_buffer.do_write() && do_a_write(woke, conn, token) {}
+fn shunt_io(conn: &mut Conn, token: Token) {
+    while conn.read_buffer.do_read() && do_a_read(conn, token) {}
+    while conn.write_buffer.do_write() && do_a_write(conn, token) {}
 }
 
-fn do_a_read(woke: &mut Vec<Event>, conn: &mut Conn, token: Token) -> bool {
+fn do_a_read(conn: &mut Conn, token: Token) -> bool {
     let mut buf = [0u8; BUF_SIZE];
     match conn.inner.read(&mut buf) {
         Ok(0) => {
-            conn.read_buffer.become_draining_close();
-            woke.push(Event::Done(token, Direction::Read));
+            conn.read_buffer.become_at_least_draining_close();
             false
         }
 
@@ -414,7 +426,6 @@ fn do_a_read(woke: &mut Vec<Event>, conn: &mut Conn, token: Token) -> bool {
                 .buf_mut()
                 .expect("TODO: read completed on non-buffer")
                 .extend_from_slice(&buf[..r]);
-            woke.push(Event::Data(token));
             true
         }
 
@@ -422,13 +433,13 @@ fn do_a_read(woke: &mut Vec<Event>, conn: &mut Conn, token: Token) -> bool {
 
         Err(e) => {
             info!("{} read-err {:?}", token.0, e);
-            conn.read_buffer.become_truncating_close();
-            true
+            conn.read_buffer.become_at_least_draining_close();
+            false
         }
     }
 }
 
-fn do_a_write(woke: &mut Vec<Event>, conn: &mut Conn, token: Token) -> bool {
+fn do_a_write(conn: &mut Conn, token: Token) -> bool {
     match conn.inner.write(
         conn.write_buffer
             .buf()
@@ -437,7 +448,6 @@ fn do_a_write(woke: &mut Vec<Event>, conn: &mut Conn, token: Token) -> bool {
         Ok(0) => {
             info!("{} write-eof", token.0);
             conn.write_buffer.totes_done();
-            woke.push(Event::Done(token, Direction::Write));
             false
         }
         Ok(w) => {
@@ -447,7 +457,6 @@ fn do_a_write(woke: &mut Vec<Event>, conn: &mut Conn, token: Token) -> bool {
                     .expect("wrote data, should be able to discard it")
                     .drain(..w),
             );
-            woke.push(Event::Data(token));
             true
         }
 
