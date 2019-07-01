@@ -385,71 +385,79 @@ impl Net {
                         },
                     );
                 }
-                OwnedMode::Conn(ref mut conn) => {
-                    let mut buf = [0u8; BUF_SIZE];
-                    while conn.read_buffer.do_read() {
-                        match conn.inner.read(&mut buf) {
-                            Ok(0) => {
-                                conn.read_buffer.become_draining_close();
-                                woke.push(Event::Done(ev.token(), Direction::Read));
-                                break;
-                            }
-
-                            Ok(r) => {
-                                conn.read_buffer
-                                    .buf_mut()
-                                    .expect("TODO: read completed on non-buffer")
-                                    .extend_from_slice(&buf[..r]);
-                                woke.push(Event::Data(ev.token()));
-                            }
-
-                            Err(ref e) if io::ErrorKind::WouldBlock == e.kind() => break,
-
-                            Err(e) => {
-                                info!("{} read-err {:?}", ev.token().0, e);
-                                conn.read_buffer.become_truncating_close();
-                            }
-                        }
-                    }
-
-                    while conn.write_buffer.do_write() {
-                        match conn.inner.write(
-                            conn.write_buffer
-                                .buf()
-                                .expect("asked to write, should be able to see data to write"),
-                        ) {
-                            Ok(0) => {
-                                info!("{} write-eof", ev.token().0);
-                                conn.write_buffer.totes_done();
-                                woke.push(Event::Done(ev.token(), Direction::Write));
-                                break;
-                            }
-                            Ok(w) => {
-                                drop(
-                                    conn.write_buffer
-                                        .buf_mut()
-                                        .expect("wrote data, should be able to discard it")
-                                        .drain(..w),
-                                );
-                                woke.push(Event::Data(ev.token()));
-                            }
-
-                            Err(ref e) if io::ErrorKind::WouldBlock == e.kind() => break,
-
-                            Err(e) => {
-                                info!("{} write-err {:?}", ev.token().0, e);
-                                conn.write_buffer.totes_done();
-                                break;
-                            }
-                        }
-                    }
-                }
+                OwnedMode::Conn(ref mut conn) => shunt_io(&mut woke, conn, ev.token()),
             }
 
             self.events.extend(woke);
         }
 
         Ok(())
+    }
+}
+
+fn shunt_io(woke: &mut Vec<Event>, conn: &mut Conn, token: Token) {
+    while conn.read_buffer.do_read() && do_a_read(woke, conn, token) {}
+    while conn.write_buffer.do_write() && do_a_write(woke, conn, token) {}
+}
+
+fn do_a_read(woke: &mut Vec<Event>, conn: &mut Conn, token: Token) -> bool {
+    let mut buf = [0u8; BUF_SIZE];
+    match conn.inner.read(&mut buf) {
+        Ok(0) => {
+            conn.read_buffer.become_draining_close();
+            woke.push(Event::Done(token, Direction::Read));
+            false
+        }
+
+        Ok(r) => {
+            conn.read_buffer
+                .buf_mut()
+                .expect("TODO: read completed on non-buffer")
+                .extend_from_slice(&buf[..r]);
+            woke.push(Event::Data(token));
+            true
+        }
+
+        Err(ref e) if io::ErrorKind::WouldBlock == e.kind() => false,
+
+        Err(e) => {
+            info!("{} read-err {:?}", token.0, e);
+            conn.read_buffer.become_truncating_close();
+            true
+        }
+    }
+}
+
+fn do_a_write(woke: &mut Vec<Event>, conn: &mut Conn, token: Token) -> bool {
+    match conn.inner.write(
+        conn.write_buffer
+            .buf()
+            .expect("asked to write, should be able to see data to write"),
+    ) {
+        Ok(0) => {
+            info!("{} write-eof", token.0);
+            conn.write_buffer.totes_done();
+            woke.push(Event::Done(token, Direction::Write));
+            false
+        }
+        Ok(w) => {
+            drop(
+                conn.write_buffer
+                    .buf_mut()
+                    .expect("wrote data, should be able to discard it")
+                    .drain(..w),
+            );
+            woke.push(Event::Data(token));
+            true
+        }
+
+        Err(ref e) if io::ErrorKind::WouldBlock == e.kind() => false,
+
+        Err(e) => {
+            info!("{} write-err {:?}", token.0, e);
+            conn.write_buffer.totes_done();
+            false
+        }
     }
 }
 
